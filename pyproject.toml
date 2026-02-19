@@ -12,6 +12,7 @@ license-files = ['LICEN[CS]E*', 'COPYING*', 'NOTICE*', 'AUTHORS*']
 
 [project.scripts]
 coffeematon = "coffeematon.__main__:main"
+coffeematon-benchmark = "coffeematon.benchmark:main"
 
 [tool.setuptools.dynamic]
 readme = { file = ["README.md"] }

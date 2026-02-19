@@ -1,20 +1,20 @@
 import os
 import shutil
-import numpy as np
+from abc import abstractmethod
+from concurrent.futures import Executor, ThreadPoolExecutor
+from csv import DictWriter
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Dict, List, Optional, Tuple
 
-from abc import abstractmethod
-from csv import DictWriter
-
+import numpy as np
+from PIL import Image
 from tqdm import trange
 
 from coffeematon.coarse_grain import coarse_grained, smooth
 from coffeematon.diff_encoding import generate_diff
-from coffeematon.encoding import zip_array
+from coffeematon.encoding import Compression, zip_array
 from coffeematon.generate_gifs import generate_gif
-from PIL import Image
 
 
 class ArrayTypes(Enum):
@@ -28,8 +28,6 @@ class ArrayTypes(Enum):
     MASK_3 = "mask_3"
     MASK_7 = "mask_7"
     MASK_11 = "mask_11"
-    # MDL_COMPLEXITY = "mdlc"
-    # MDL_ENTROPY = "mdle"
 
 
 class InitialStates(Enum):
@@ -41,7 +39,12 @@ class Automaton:
     NAME = "GENERIC"
 
     def __init__(
-        self, n, initial_state: Optional[InitialStates] = None, save: bool = True
+        self,
+        n,
+        initial_state: Optional[InitialStates] = None,
+        save: bool = True,
+        workers: Optional[int] = None,
+        compression: Compression = Compression.GZIP,
     ):
         self.n = n
         if initial_state is None:
@@ -54,15 +57,24 @@ class Automaton:
         self.complexities = {complexity: [] for complexity in ArrayTypes}
         self.esttime = self.timesteps()
         self.results_dir = Path("data", "results")
-        # Compute grain size
         grainsize = round(np.sqrt(n))
         if grainsize % 2 == 0:
             grainsize += 1
         self.grainsize = grainsize
-        # Set max value for coarse-grained image thresholding
         self.maxval = 1.0
         self.parameters = (self.initial_state.value, self.NAME, str(self.n))
         self.save = save
+        requested_workers = workers if workers is not None else (os.cpu_count() or 1)
+        self.workers = max(1, requested_workers)
+        self.compression = Compression(compression)
+
+    @property
+    def effective_workers(self) -> int:
+        """Adaptive worker count to avoid thread overhead on small grids."""
+        if self.n < 48:
+            return 1
+        task_parallelism = len(ArrayTypes)
+        return max(1, min(self.workers, task_parallelism))
 
     @staticmethod
     def parameters_to_str(parameters: List[str]):
@@ -92,6 +104,48 @@ class Automaton:
     def timesteps(self):
         """Return the estimated number of steps to convergence for the automaton."""
 
+    def compute_arrays(
+        self,
+        executor: Optional[Executor] = None,
+    ) -> Dict[ArrayTypes, np.ndarray]:
+        if executor is None or self.effective_workers <= 1:
+            smoothed = smooth(self.cells, self.grainsize)
+            coarse_3 = coarse_grained(smoothed, self.maxval, 3)
+            coarse_7 = coarse_grained(smoothed, self.maxval, 7)
+            coarse_11 = coarse_grained(smoothed, self.maxval, 11)
+            diff3, mask3 = generate_diff(self.cells, coarse_3)
+            diff7, mask7 = generate_diff(self.cells, coarse_7)
+            diff11, mask11 = generate_diff(self.cells, coarse_11)
+        else:
+            smoothed = smooth(self.cells, self.grainsize)
+            coarse_3, coarse_7, coarse_11 = list(
+                executor.map(
+                    lambda n_categories: coarse_grained(
+                        smoothed, self.maxval, n_categories
+                    ),
+                    (3, 7, 11),
+                )
+            )
+            (diff3, mask3), (diff7, mask7), (diff11, mask11) = list(
+                executor.map(
+                    lambda arr: generate_diff(self.cells, arr),
+                    (coarse_3, coarse_7, coarse_11),
+                )
+            )
+
+        return {
+            ArrayTypes.FINE: self.cells,
+            ArrayTypes.COARSE_3: coarse_3,
+            ArrayTypes.COARSE_7: coarse_7,
+            ArrayTypes.COARSE_11: coarse_11,
+            ArrayTypes.DIFF_3: diff3,
+            ArrayTypes.DIFF_7: diff7,
+            ArrayTypes.DIFF_11: diff11,
+            ArrayTypes.MASK_3: mask3,
+            ArrayTypes.MASK_7: mask7,
+            ArrayTypes.MASK_11: mask11,
+        }
+
     def simulate(
         self, n_steps: Optional[int] = None, max_save_steps: int = 1000
     ) -> Path:
@@ -107,48 +161,27 @@ class Automaton:
             bitmaps_dir = self.create_bitmaps_results_folder()
             csv_path = self.create_csv_results_file()
 
-        loadbar = trange(n_steps, total=n_steps, desc="Simulating")
-        for step in loadbar:
-            self.step = step
-            save_stepsize = n_steps // max_save_steps
-            if (save_stepsize == 0) or (step % save_stepsize) == 0:
-                smoothed = smooth(self.cells, self.grainsize)
-                coarse_3 = coarse_grained(smoothed, self.maxval, 3)
-                coarse_7 = coarse_grained(smoothed, self.maxval, 7)
-                coarse_11 = coarse_grained(smoothed, self.maxval, 11)
+        with ThreadPoolExecutor(max_workers=self.effective_workers) as executor:
+            loadbar = trange(n_steps, total=n_steps, desc="Simulating")
+            for step in loadbar:
+                self.step = step
+                save_stepsize = n_steps // max_save_steps
+                if (save_stepsize == 0) or (step % save_stepsize) == 0:
+                    c_type_to_arr = self.compute_arrays(executor=executor)
+                    self.steps.append(step)
+                    self.compute_complexities(c_type_to_arr, executor=executor)
+                    if self.save:
+                        self.save_results(csv_path)
+                        self.save_images(bitmaps_dir, step, c_type_to_arr)
 
-                diff3, mask3 = generate_diff(self.cells, coarse_3)
-                diff7, mask7 = generate_diff(self.cells, coarse_7)
-                diff11, mask11 = generate_diff(self.cells, coarse_11)
-
-                c_type_to_arr = {
-                    ArrayTypes.FINE: self.cells,
-                    ArrayTypes.COARSE_3: coarse_3,
-                    ArrayTypes.COARSE_7: coarse_7,
-                    ArrayTypes.COARSE_11: coarse_11,
-                    ArrayTypes.DIFF_3: diff3,
-                    ArrayTypes.DIFF_7: diff7,
-                    ArrayTypes.DIFF_11: diff11,
-                    ArrayTypes.MASK_3: mask3,
-                    ArrayTypes.MASK_7: mask7,
-                    ArrayTypes.MASK_11: mask11,
-                }
-
-                self.steps.append(step)
-                self.compute_complexities(c_type_to_arr)
-                if self.save:
-                    self.save_results(csv_path)
-                    self.save_images(bitmaps_dir, step, c_type_to_arr)
-
-                # Loadbar display
-                relevant_types = [ArrayTypes.FINE, ArrayTypes.COARSE_3]
-                relevant_params = [
-                    f"{c_type.value.capitalize()}: {self.complexities[c_type][-1]:.2E}"
-                    for c_type in relevant_types
-                ]
-                loadbar.desc = " | ".join(["Simulating"] + relevant_params)
-                loadbar.update()
-            self.next()
+                    relevant_types = [ArrayTypes.FINE, ArrayTypes.COARSE_3]
+                    relevant_params = [
+                        f"{c_type.value.capitalize()}: {self.complexities[c_type][-1]:.2E}"
+                        for c_type in relevant_types
+                    ]
+                    loadbar.desc = " | ".join(["Simulating"] + relevant_params)
+                    loadbar.update()
+                self.next()
 
         if self.save:
             self.save_gifs(bitmaps_dir)
@@ -200,14 +233,25 @@ class Automaton:
             results_writer = DictWriter(results_file, self.results_fields)
             results_writer.writerow(results)
 
-    def compute_complexities(self, c_type_to_arr: Dict[ArrayTypes, np.ndarray]):
-        for c_type, arr in c_type_to_arr.items():
-            c_val = zip_array(arr)
-            self.complexities[c_type].append(c_val)
+    def compute_complexities(
+        self,
+        c_type_to_arr: Dict[ArrayTypes, np.ndarray],
+        executor: Optional[Executor] = None,
+    ):
+        complexity_items = list(c_type_to_arr.items())
+        arrays: Tuple[np.ndarray, ...] = tuple(arr for _, arr in complexity_items)
+        if executor is None or self.effective_workers <= 1:
+            c_values = [zip_array(arr, self.compression) for arr in arrays]
+        else:
+            c_values = list(
+                executor.map(
+                    lambda arr: zip_array(arr, self.compression),
+                    arrays,
+                )
+            )
 
-        # mdl_complexity, mdl_entropy = encoded_sizes(self.cells)
-        # self.complexities[Complexities.MDL_COMPLEXITY].append(mdl_complexity)
-        # self.complexities[Complexities.MDL_ENTROPY].append(mdl_entropy)
+        for (c_type, _), c_val in zip(complexity_items, c_values):
+            self.complexities[c_type].append(c_val)
 
     def save_images(
         self,

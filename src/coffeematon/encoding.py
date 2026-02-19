@@ -1,18 +1,22 @@
 """Tools to estimate the entropy and complexity of the cellular automaton."""
 
-
-import gzip
 import bz2
+import gzip
 from enum import Enum
 from typing import Union
+
 import numpy as np
 
-save_images = True
+try:
+    import zstandard as zstd
+except ModuleNotFoundError:
+    zstd = None
 
 
 class Compression(Enum):
     BZIP = "bzip"
     GZIP = "gzip"
+    ZSTD = "zstd"
 
 
 def zip_array(
@@ -28,11 +32,19 @@ def zip_string(
     return zip_bytes(byte_string, compression)
 
 
-def zip_bytes(bytes: bytes, compression: Union[Compression, str]) -> int:
-    if Compression(compression) is Compression.GZIP:
-        return len(gzip.compress(bytes))
-    if Compression(compression) is Compression.BZIP:
-        return len(bz2.compress(bytes))
+def zip_bytes(data: bytes, compression: Union[Compression, str]) -> int:
+    compression = Compression(compression)
+    if compression is Compression.GZIP:
+        return len(gzip.compress(data))
+    if compression is Compression.BZIP:
+        return len(bz2.compress(data))
+    if compression is Compression.ZSTD:
+        if zstd is None:
+            raise ModuleNotFoundError(
+                "zstandard is not installed. Install with `pip install zstandard`."
+            )
+        return len(zstd.ZstdCompressor(level=3).compress(data))
+    raise ValueError(f"Unsupported compression: {compression}")
 
 
 def write_string(array):
