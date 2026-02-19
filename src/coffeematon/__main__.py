@@ -2,26 +2,30 @@
 Collecting automaton output
 """
 
-from time import time
 import argparse
-from typing import Dict, Optional
-
+from time import time
+from typing import Dict, Optional, Type
 
 import numpy
 
-
 from coffeematon.automatons.automaton import Automaton, ArrayTypes, InitialStates
-from coffeematon.automatons.nonint_automaton import NonInteractingAutomaton
 from coffeematon.automatons.int_automaton import InteractingAutomaton
-from coffeematon.automatons.fluid_automaton import FluidAutomaton
+from coffeematon.automatons.nonint_automaton import NonInteractingAutomaton
+from coffeematon.encoding import Compression
 from coffeematon.plot_results import plot_results
 
+try:
+    from coffeematon.automatons.fluid_automaton import FluidAutomaton
+except ModuleNotFoundError:
+    FluidAutomaton = None
 
-AUTOMATONS: Dict[str, Automaton] = {
+
+AUTOMATONS: Dict[str, Type[Automaton]] = {
     "nonint": NonInteractingAutomaton,
     "int": InteractingAutomaton,
-    "fluid": FluidAutomaton,
 }
+if FluidAutomaton is not None:
+    AUTOMATONS["fluid"] = FluidAutomaton
 
 
 def experiment_for_n(
@@ -29,8 +33,17 @@ def experiment_for_n(
     n: int,
     init: Optional[InitialStates] = None,
     save: bool = True,
+    workers: Optional[int] = None,
+    compression: str = Compression.GZIP.value,
 ):
-    automaton: Automaton = AUTOMATONS.get(automaton_type)(n, init, save=save)
+    automaton_class = AUTOMATONS[automaton_type]
+    automaton: Automaton = automaton_class(
+        n,
+        init,
+        save=save,
+        workers=workers,
+        compression=compression,
+    )
 
     t_start = time()
     csv_results_path = automaton.simulate()
@@ -39,7 +52,6 @@ def experiment_for_n(
 
     plot_results(csv_results_path)
 
-    # Return statistics
     mix_time = automaton.step
     emax_val = max(automaton.complexities[ArrayTypes.FINE])
     cmax_time = automaton.steps[
@@ -58,7 +70,6 @@ def data_for_range(type, start, stop, step=1):
 
     t1 = time()
     for n in ns:
-        # Collect statistics for each value of n
         (mix_time, emax_val, cmax_time, cmax_val) = experiment_for_n(type, n)
         mix_times.append(mix_time)
         emax_vals.append(emax_val)
@@ -67,7 +78,6 @@ def data_for_range(type, start, stop, step=1):
     t2 = time()
     print(f"Total time: {t2 - t1:d} sec.")
 
-    # Save statistics to file
     f = open("stats_%s_%d_%d" % (type, start, stop - step), "w")
     f.write("ns = " + str(ns) + "\n")
     f.write("mix_times = " + str(mix_times) + "\n")
@@ -98,8 +108,26 @@ def main():
         choices=[i.value for i in InitialStates],
         default="updown",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Number of worker threads used to compute compressed sizes.",
+        default=None,
+    )
+    parser.add_argument(
+        "--compression",
+        choices=[c.value for c in Compression],
+        default=Compression.GZIP.value,
+        help="Compression backend used for complexity estimation.",
+    )
     args = parser.parse_args()
-    experiment_for_n(args.automaton, args.n, args.init)
+    experiment_for_n(
+        args.automaton,
+        args.n,
+        args.init,
+        workers=args.workers,
+        compression=args.compression,
+    )
 
 
 if __name__ == "__main__":

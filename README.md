@@ -97,6 +97,16 @@ Launch an experiment
 python -m coffeematon --help
 ```
 
+Run with multithreaded compression metrics and selectable compression backend:
+```bash
+python -m coffeematon -a int -n 100 --workers 8 --compression gzip
+```
+
+Run the benchmark harness to compare worker counts:
+```bash
+python -m coffeematon.benchmark --n 120 --steps 300 --workers 1 2 4 8 --repeats 3
+```
+
 Plot a graph from a csv results file
 ```bash
 python -m coffeematon.plot_results --help
